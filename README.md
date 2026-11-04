@@ -1,66 +1,55 @@
 # Improved Untargeted APGD
 
-**An improved implementation of Auto-PGD (APGD) featuring hybrid loss optimization for stronger and more efficient untargeted adversarial attacks.**
+An improved implementation of **Auto-PGD (APGD)** for adversarial robustness evaluation, based on [AutoAttack](https://github.com/fra31/auto-attack).
 
-This repository contains the implementation of the methods proposed in:
+This repository provides the implementation of the methods proposed in:
 
 **Breaking the Trade-off between Performance and Cost with an Improved Untargeted APGD**
 
 Ammar Al-Najjar and Márk Jelasity  
-ESANN 2026 — European Symposium on Artificial Neural Networks, Computational Intelligence and Machine Learning.
+European Symposium on Artificial Neural Networks, Computational Intelligence and Machine Learning (ESANN), 2026.
 
-[Read the paper](https://doi.org/10.14428/esann/2026.ES2026-164)
-
----
+[Paper DOI: 10.14428/esann/2026.ES2026-164](https://doi.org/10.14428/esann/2026.ES2026-164)
 
 ## Overview
 
-Auto-PGD (APGD), a core component of [AutoAttack](https://github.com/fra31/auto-attack), uses surrogate loss functions such as Cross-Entropy (CE) and Difference of Logits Ratio (DLR) to generate adversarial examples.
+Auto-PGD (APGD) is an adaptive gradient-based attack used in adversarial robustness evaluation. Its standard implementation uses different objective functions, including Cross-Entropy (CE) and Difference of Logits Ratio (DLR).
 
-Although untargeted APGD variants are computationally efficient, targeted APGD variants generally achieve stronger attacks at a substantially higher computational cost.
+This work introduces hybrid APGD variants that combine objective functions in different optimization phases to improve attack performance without introducing the computational overhead of a separate, full targeted attack.
 
-This work introduces hybrid untargeted APGD variants that combine CE and DLR sequentially during different stages of the optimization process.
+The proposed approach preserves the underlying APGD optimization procedure, including its adaptive step-size mechanism and projection operations, while modifying the objective-function strategy and initialization.
 
-The proposed methods improve the effectiveness of untargeted APGD while maintaining computational costs comparable to standard untargeted variants.
+Three variants are investigated:
 
-## Proposed Methods
+- **Variant A:** Uses CE during the initialization phase, followed by the untargeted DLR objective during the main optimization phase.
+- **Variant A+:** Extends Variant A with preliminary optimization steps using the negated targeted DLR objective. The target is selected as the 10th most confident class (\(r=10\)). The optimization switches to untargeted DLR once the target stabilizes.
+- **Variant B:** Uses DLR during initialization, followed by CE during the main optimization phase.
 
-We introduce three hybrid APGD variants:
+The experiments show that Variant A consistently improves upon standard APGD-DLR, while Variant A+ provides additional, more modest improvements. The proposed approach achieves competitive attack performance at a computational cost comparable to untargeted APGD.
 
-### Variant A — CE to DLR
+## Installation
 
-- Uses Cross-Entropy (CE) during the initialization phase.
-- Transitions to untargeted DLR during the main optimization phase.
+Install the package directly from GitHub:
 
-The motivation is to benefit from the strong initial gradients provided by CE while using DLR for the main optimization process.
+```bash
+pip install git+https://github.com/ai-liteworld/improved-apgd.git
+```
 
-### Variant A+ — CE to Target Refinement to DLR
+Alternatively, clone the repository:
 
-Variant A+ extends Variant A with an additional initialization procedure.
-
-- Starts with CE-based initialization.
-- Performs preliminary optimization steps using the negated targeted DLR loss.
-- Selects the target as the 10th most confident class.
-- Monitors target stabilization and switches to standard untargeted DLR once the selected targets stabilize.
-
-This additional procedure improves the initialization of the untargeted optimization.
-
-### Variant B — DLR to CE
-
-- Uses DLR during the initialization phase.
-- Transitions to CE during the main optimization phase.
-
-This variant investigates the effect of reversing the loss ordering.
+```bash
+git clone https://github.com/ai-liteworld/improved-apgd.git
+cd improved-apgd
+pip install -e .
+```
 
 ## Configuration
 
-**Important:** The proposed variants are currently selected through manual configuration inside the source code. They are not yet exposed as arguments in the `AutoAttack` constructor.
+**Important:** The proposed configuration must currently be enabled manually in:
 
-Open:
+`autoattack/autopgd_base.py`
 
-[`autoattack/autopgd_base.py`](https://github.com/ai-liteworld/improved-apgd/blob/master/autoattack/autopgd_base.py)
-
-Locate the following flags and configure them as shown:
+Set the following flags:
 
 ```python
 self.standard = False
@@ -68,36 +57,36 @@ self.stability = True
 self.targeted = False
 ```
 
-These settings enable the proposed untargeted hybrid variants (A/A+) rather than the standard or targeted APGD configurations.
+These settings activate the proposed untargeted hybrid APGD configuration (Variants A/A+).
 
-To use the proposed methods, make sure these flags are set before running the attack.
-
-## Installation
-
-Install directly from this repository:
-
-```bash
-pip install git+https://github.com/ai-liteworld/improved-apgd.git
-```
+The flags are currently configured directly in the source code rather than exposed as arguments in the `AutoAttack` constructor.
 
 ## Usage
 
-The implementation retains the original AutoAttack package structure and PyTorch interface.
+### Running the improved APGD variants
+
+The proposed method replaces the standard APGD variants in the AutoAttack evaluation pipeline.
+
+To benefit from the computational cost reduction, run the APGD attacks directly using AutoAttack's custom version. Avoid using `version='standard'` for this purpose, as it also executes FAB-T and Square Attack.
+
+Example:
 
 ```python
+import torch
 from autoattack import AutoAttack
 
-# Your PyTorch model should return logits.
 model.eval()
 
 adversary = AutoAttack(
     model,
     norm='Linf',
     eps=8/255,
-    version='standard'
+    version='custom'
 )
 
-# Generate adversarial examples.
+# Run only the APGD variants
+adversary.attacks_to_run = ['apgd-ce', 'apgd-t']
+
 x_adv = adversary.run_standard_evaluation(
     x_test,
     y_test,
@@ -105,31 +94,28 @@ x_adv = adversary.run_standard_evaluation(
 )
 ```
 
-**Note:** Configure the flags in `autoattack/autopgd_base.py` before running the attack, as described in the Configuration section.
+Make sure the configuration flags described above are set before running the evaluation.
 
-Inputs are expected to be PyTorch tensors in NCHW format, with image values in the range [0, 1].
+### Important distinction
 
-For additional interface details, see the original [AutoAttack documentation](https://github.com/fra31/auto-attack).
+The custom configuration runs only the selected APGD attacks. It does not run FAB or Square Attack.
+
+This allows the proposed APGD improvements to be evaluated without the additional computational cost of the other attacks included in the full AutoAttack evaluation.
 
 ## Experimental Evaluation
 
-The methods were evaluated using pretrained robust WideResNet architectures across multiple datasets:
+The proposed methods were evaluated on:
 
 - CIFAR-10
 - CIFAR-100
 - SVHN
 - TinyImageNet
 
-The experiments considered both \(L_\infty\) and \(L_2\) threat models.
+Experiments covered both \(L_\infty\) and \(L_2\) threat models and included robust WideResNet architectures.
 
-The results demonstrate that:
+The evaluation used 100 gradient steps and one restart, with additional comparisons against the five-restart setting used in RobustBench.
 
-- Variant A consistently improves upon standard APGD-DLR.
-- Variant A+ provides additional improvements through its stabilization procedure.
-- Variant B is generally less effective than the CE-to-DLR ordering.
-- The proposed variants achieve attack effectiveness comparable to targeted APGD while maintaining computational costs similar to untargeted APGD.
-
-For the complete experimental setup, quantitative results, and analysis, please refer to the [published paper](https://doi.org/10.14428/esann/2026.ES2026-164).
+For the detailed experimental setup, results, and analysis, please refer to the published paper.
 
 ## Citation
 
@@ -147,12 +133,8 @@ If you use this implementation in your research, please cite the following paper
 
 ## Acknowledgements
 
-This implementation builds upon the original [AutoAttack](https://github.com/fra31/auto-attack) repository by Francesco Croce and Matthias Hein.
+This implementation is based on [AutoAttack](https://github.com/fra31/auto-attack), developed by Francesco Croce and Matthias Hein.
 
-We acknowledge their original implementation and retain the underlying APGD framework while introducing the modifications described in our work.
+We acknowledge the original authors for making their implementation publicly available. The original repository's license is preserved in this project.
 
-Original AutoAttack repository: https://github.com/fra31/auto-attack
-
-## License
-
-Please refer to the included `LICENSE` file for licensing information.
+For details about the original AutoAttack implementation, please refer to its [GitHub repository](https://github.com/fra31/auto-attack).
