@@ -52,31 +52,25 @@ This additional procedure improves the initialization of the untargeted optimiza
 
 This variant investigates the effect of reversing the loss ordering.
 
-## Methodology
+## Configuration
 
-The proposed methods retain the underlying APGD optimization framework, including its adaptive step-size mechanism and projection procedure.
+**Important:** The proposed variants are currently selected through manual configuration inside the source code. They are not yet exposed as arguments in the `AutoAttack` constructor.
 
-The primary modification is the sequential use of different surrogate losses during the initialization and main optimization phases.
+Open:
 
-## Experimental Evaluation
+[`autoattack/autopgd_base.py`](https://github.com/ai-liteworld/improved-apgd/blob/master/autoattack/autopgd_base.py)
 
-The methods were evaluated using pretrained robust WideResNet architectures across multiple datasets:
+Locate the following flags and configure them as shown:
 
-- CIFAR-10
-- CIFAR-100
-- SVHN
-- TinyImageNet
+```python
+self.standard = False
+self.stability = True
+self.targeted = False
+```
 
-The experiments considered both \(L_\infty\) and \(L_2\) threat models.
+These settings enable the proposed untargeted hybrid variants (A/A+) rather than the standard or targeted APGD configurations.
 
-The results demonstrate that:
-
-- Variant A consistently improves upon standard APGD-DLR.
-- Variant A+ provides additional improvements through its stabilization procedure.
-- Variant B is generally less effective than the CE-to-DLR ordering.
-- The proposed variants achieve attack effectiveness comparable to targeted APGD while maintaining computational costs similar to untargeted APGD.
-
-For the complete experimental setup, quantitative results, and analysis, please refer to the [published paper](https://doi.org/10.14428/esann/2026.ES2026-164).
+To use the proposed methods, make sure these flags are set before running the attack.
 
 ## Installation
 
@@ -88,9 +82,7 @@ pip install git+https://github.com/ai-liteworld/improved-apgd.git
 
 ## Usage
 
-This implementation retains the original AutoAttack package structure and its PyTorch interface.
-
-A basic example using the AutoAttack interface:
+The implementation retains the original AutoAttack package structure and PyTorch interface.
 
 ```python
 from autoattack import AutoAttack
@@ -113,11 +105,31 @@ x_adv = adversary.run_standard_evaluation(
 )
 ```
 
+**Note:** Configure the flags in `autoattack/autopgd_base.py` before running the attack, as described in the Configuration section.
+
 Inputs are expected to be PyTorch tensors in NCHW format, with image values in the range [0, 1].
 
-See the original [AutoAttack documentation](https://github.com/fra31/auto-attack) for additional interface details.
+For additional interface details, see the original [AutoAttack documentation](https://github.com/fra31/auto-attack).
 
-**Note:** The exact configuration for selecting individual proposed variants should follow the implementation provided in this repository.
+## Experimental Evaluation
+
+The methods were evaluated using pretrained robust WideResNet architectures across multiple datasets:
+
+- CIFAR-10
+- CIFAR-100
+- SVHN
+- TinyImageNet
+
+The experiments considered both \(L_\infty\) and \(L_2\) threat models.
+
+The results demonstrate that:
+
+- Variant A consistently improves upon standard APGD-DLR.
+- Variant A+ provides additional improvements through its stabilization procedure.
+- Variant B is generally less effective than the CE-to-DLR ordering.
+- The proposed variants achieve attack effectiveness comparable to targeted APGD while maintaining computational costs similar to untargeted APGD.
+
+For the complete experimental setup, quantitative results, and analysis, please refer to the [published paper](https://doi.org/10.14428/esann/2026.ES2026-164).
 
 ## Citation
 
