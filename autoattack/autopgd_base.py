@@ -6,6 +6,7 @@
 #
 
 import time
+from typing import Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +15,10 @@ import random
 
 from autoattack.other_utils import L0_norm, L1_norm, L2_norm
 from autoattack.checks import check_zero_gradients
-
+import numpy as np
+from collections import Counter
+import csv
+import os
 
 def L1_projection(x2, y2, eps1):
     '''
@@ -118,11 +122,16 @@ class APGDAttack():
             device=None,
             use_largereps=False,
             is_tf_model=False,
+            n_target_classes = 9,
             logger=None):
         """
         AutoPGD implementation in PyTorch
         """
-        
+        self.batch_idx  = 0
+        self.standard = False
+        self.stability = True
+        self.targeted = False
+        self.n_target_classes = n_target_classes
         self.model = predict
         self.n_iter = n_iter
         self.eps = eps
@@ -145,7 +154,8 @@ class APGDAttack():
         self.is_tf_model = is_tf_model
         self.y_target = None
         self.logger = logger
-
+        self.topk_targets = None
+        self.flipped_sweet_spot = 0
         assert self.norm in ['Linf', 'L2', 'L1']
         assert not self.eps is None
 
@@ -191,13 +201,19 @@ class APGDAttack():
     def dlr_loss(self, x, y):
         x_sorted, ind_sorted = x.sort(dim=1)
         ind = (ind_sorted[:, -1] == y).float()
-        u = torch.arange(x.shape[0])
+        u = torch.arange(x.shape[0], device=x.device)
+        num = -(x[u, y] - x_sorted[:, -2] * ind - x_sorted[:, -1] * (1. - ind))
+        denom = (x_sorted[:, -1] - x_sorted[:, -3] + 1e-12)
+        return num / denom
 
-        return -(x[u, y] - x_sorted[:, -2] * ind - x_sorted[:, -1] * (
-            1. - ind)) / (x_sorted[:, -1] - x_sorted[:, -3] + 1e-12)
-
-    #
+    def dlr_loss_targeted_flipped(self, x, y, y_target):
+        x_sorted, ind_sorted = x.sort(dim=1)
+        u = torch.arange(x.shape[0], device=x.device)
+        num = -(x[u, y] - x[u, y_target])
+        denom = (x_sorted[:, -1] - .5 * (x_sorted[:, -3] + x_sorted[:, -4]) + 1e-12)
+        return num / denom
     
+
     def attack_single_run(self, x, y, x_init=None):
         if len(x.shape) < self.ndims:
             x = x.unsqueeze(0)
@@ -260,16 +276,30 @@ class APGDAttack():
             else:
                 raise ValueError('unknowkn loss')
         
-        
+
+        # Initialize CSV file (only once before training)
+        if not os.path.exists(save_path):
+            with open(save_path, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["bs","iteration", "margin_CE",  "margin_CE2","margin_DLR_S", "margin_DLR"])  # header
+
+        # Helper: compute mean margin
+        def compute_margin(outputs, labels):
+            z_max = outputs.max(1).values
+            z_true = outputs[torch.arange(outputs.size(0)), labels]
+            return (z_max - z_true).mean().item()
+
+        margins = []
         x_adv.requires_grad_()
         grad = torch.zeros_like(x)
         for _ in range(self.eot_iter):
             if not self.is_tf_model:
                 with torch.enable_grad():
-                    logits = self.model(x_adv)
-                    loss_indiv = criterion_indiv(logits, y)
+                    logits = self.model(x_adv) 
+                    loss_indiv = criterion_indiv(logits, y) # first iteration  ****************************************
                     loss = loss_indiv.sum()
-
+                    margin_CE   = compute_margin(logits, y)
+                
                 grad += torch.autograd.grad(loss, [x_adv])[0].detach()
             else:
                 if self.y_target is None:
@@ -281,7 +311,9 @@ class APGDAttack():
         
         grad /= float(self.eot_iter)
         grad_best = grad.clone()
-
+        z_max = logits.max(1).values
+        z_true = logits[torch.arange(logits.size(0)), y]
+        margins.append((z_max - z_true).mean().item())
         if self.loss in ['dlr', 'dlr-targeted']:
             # check if there are zero gradients
             check_zero_gradients(grad, logger=self.logger)
@@ -314,7 +346,14 @@ class APGDAttack():
         loss_best_last_check = loss_best.clone()
         reduced_last_check = torch.ones_like(loss_best)
         n_reduced = 0
-
+    
+        previous_topk_targets = None
+        similarity_reached = False
+        sims = []
+        if self.flipped_sweet_spot == 0:
+            warmup = 1
+        else:
+            warmup = self.flipped_sweet_spot
         u = torch.arange(x.shape[0], device=self.device)
         for i in range(self.n_iter):
             ### gradient step
@@ -357,17 +396,88 @@ class APGDAttack():
                     
                     
                 x_adv = x_adv_1 + 0.
+    
 
-            ### get gradient
+            
+            def detect_jump(sims, jump_factor=1.0):
+                scores = np.array(sims)
+                if len(scores) < 3:
+                    return False
+
+                diffs = np.diff(scores)
+                prev_diffs = np.abs(diffs[:-1])
+                mean_diff = np.mean(prev_diffs) #+ 1e-8
+
+                last_jump = diffs[-2]  # ✅ use jump at index 14 → 15 instead of the real last jump
+
+                return last_jump > jump_factor * mean_diff
+
+
+
+            def reached_stability(current_topk, previous_topk):
+                """
+                Adaptive, threshold-free stability detection between two integer tensors.
+                Args:
+                    current_topk (torch.Tensor): integer tensor of class indices (current step)
+                    previous_topk (torch.Tensor): integer tensor of class indices (previous step)
+                Returns:
+                    dict with:
+                        - 'similarity': float, fraction of identical elements
+                        - 'reached': bool, True if stability_score > 1.0 (i.e. above random level)
+                """
+                if current_topk.shape != previous_topk.shape:
+                    raise ValueError("Both topk tensors must have the same shape")
+
+                # fraction of identical indices
+                similarity = (current_topk == previous_topk).float().mean().item()
+
+                sims.append(similarity)
+                jump_found  = detect_jump(sims)
+                return jump_found, similarity
+                
+
+            import sys
             x_adv.requires_grad_()
             grad = torch.zeros_like(x)
             for _ in range(self.eot_iter):
                 if not self.is_tf_model:
                     with torch.enable_grad():
                         logits = self.model(x_adv)
-                        loss_indiv = criterion_indiv(logits, y)
+                        sorted_indices = logits.sort(dim=1)[1]
+                        for target_class in range(2, 9 + 2):
+                            self.topk_targets = sorted_indices[:, -target_class]
+                        #print('shape:', torch._shape_as_tensor(self.topk_targets))
+                        # stab = rank_stability(self.topk_targets) 
+                        if self.targeted or self.standard:
+                            loss_indiv = criterion_indiv(logits, y)
+                            margin_DLR_S = None
+                            margin_DLR = None
+                            margin_CE2 =  compute_margin(logits, y)
+                        else:
+                            if not similarity_reached and self.stability:
+                                #print('\nstab idx:', i)
+                                loss_indiv = - self.dlr_loss_targeted_flipped(logits, y, self.topk_targets)
+                                margin_DLR = None
+                                margin_CE2 = None
+                                margin_DLR_S   = compute_margin(logits, y)
+                                if i > warmup :
+                                    #is_stable, similarity = compare_with_previous(self.topk_targets, previous_topk_targets)
+                                    is_stable, similarity = reached_stability(self.topk_targets, previous_topk_targets)
+                                    #print(f"similarity={similarity:.3f}")
+                                    if self.flipped_sweet_spot != 0:
+                                        similarity_reached = True
+                                    elif is_stable:
+                                        similarity_reached = True
+                                        self.flipped_sweet_spot = i
+                                        print(f"similarity reached: {similarity} at {i}")
+                                    print(f"current similarity={similarity:.3f} at {i}")  
+                                previous_topk_targets = self.topk_targets.clone()
+                            else:
+                                loss_indiv = self.dlr_loss(logits, y)
+                                margin_DLR_S = None
+                                margin_CE2 = None
+                                margin_DLR   = compute_margin(logits, y)
                         loss = loss_indiv.sum()
-    
                     grad += torch.autograd.grad(loss, [x_adv])[0].detach()
                 else:
                     if self.y_target is None:
@@ -375,9 +485,11 @@ class APGDAttack():
                     else:
                         logits, loss_indiv, grad_curr = criterion_indiv(x_adv, y, self.y_target)
                     grad += grad_curr
-            
+            with open(save_path, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([self.batch_idx, i, margin_CE, margin_CE2, margin_DLR_S, margin_DLR])
+                self.batch_idx+=1
             grad /= float(self.eot_iter)
-
             pred = logits.detach().max(1)[1] == y
             acc = torch.min(acc, pred)
             acc_steps[i + 1] = acc + 0
@@ -437,9 +549,7 @@ class APGDAttack():
                   
                   counter3 = 0
                   #k = max(k - self.size_decr, self.n_iter_min)
-
-        #
-        
+             
         return (x_best, acc, loss_best, x_best_adv)
 
     def perturb(self, x, y=None, best_loss=False, x_init=None):
@@ -588,16 +698,17 @@ class APGDAttack_targeted(APGDAttack):
             n_restarts=n_restarts, eps=eps, seed=seed, loss='dlr-targeted',
             eot_iter=eot_iter, rho=rho, topk=topk, verbose=verbose, device=device,
             use_largereps=use_largereps, is_tf_model=is_tf_model, logger=logger)
-
+        self.targeted = True
         self.y_target = None
         self.n_target_classes = n_target_classes
 
     def dlr_loss_targeted(self, x, y):
         x_sorted, ind_sorted = x.sort(dim=1)
-        u = torch.arange(x.shape[0])
-
-        return -(x[u, y] - x[u, self.y_target]) / (x_sorted[:, -1] - .5 * (
-            x_sorted[:, -3] + x_sorted[:, -4]) + 1e-12)
+        u = torch.arange(x.shape[0], device=x.device)
+        num = -(x[u, y] - x[u, self.y_target])
+        denom = (x_sorted[:, -1] - .5 * (x_sorted[:, -3] + x_sorted[:, -4]) + 1e-12)
+        return  num/denom 
+            
 
     def ce_loss_targeted(self, x, y):
         return -1. * F.cross_entropy(x, self.y_target, reduction='none')
@@ -684,4 +795,3 @@ class APGDAttack_targeted(APGDAttack):
                             time.time() - startt))
 
         return adv
-
